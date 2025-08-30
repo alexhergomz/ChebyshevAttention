@@ -126,15 +126,32 @@ def swap_attn(model, mode: str):
     class BertSelfAttentionPBFAFast(nn.Module):
         def __init__(self, orig):
             super().__init__()
-            d_model = orig.self.query.weight.shape[1]
+            # 'orig' is a BertSelfAttention module
+            d_model = orig.query.weight.shape[1]
             n_heads = orig.num_attention_heads
-            self.pbfa = CollapsedPBFAOptimized(d_model, n_heads, order=6, fused_qkv=False, den_normalization='l2')
-            self.pbfa.q_proj.weight.data.copy_(orig.self.query.weight)
-            self.pbfa.k_proj.weight.data.copy_(orig.self.key.weight)
-            self.pbfa.v_proj.weight.data.copy_(orig.self.value.weight)
-            self.pbfa.out_proj.weight.data.copy_(orig.output.dense.weight)
+            # Match BERT Linear layers (with bias); keep separate Q,K,V for easy weight copy
+            self.pbfa = CollapsedPBFAOptimized(
+                d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='l2'
+            )
+            # Copy weights and biases from the original self-attention projections
+            self.pbfa.q_proj.weight.data.copy_(orig.query.weight);    self.pbfa.q_proj.bias.data.copy_(orig.query.bias)
+            self.pbfa.k_proj.weight.data.copy_(orig.key.weight);      self.pbfa.k_proj.bias.data.copy_(orig.key.bias)
+            self.pbfa.v_proj.weight.data.copy_(orig.value.weight);    self.pbfa.v_proj.bias.data.copy_(orig.value.bias)
+
         def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False):
-            ctx = self.pbfa(hidden_states)
+            # Compute Q,K,V using PBFA projections
+            q, k, v = self.pbfa._fused_qkv(hidden_states)
+            # Convert HuggingFace attention_mask (1 for keep, 0 for pad) → boolean mask where True means mask
+            key_padding_mask = None
+            if attention_mask is not None:
+                # attention_mask: (B, S) or (B, 1, 1, S); reduce to (B,S)
+                if attention_mask.dim() == 4:
+                    attn = attention_mask.squeeze(1).squeeze(1)
+                else:
+                    attn = attention_mask
+                key_padding_mask = (attn == 0)
+            # Run attention core without PBFA's out_proj; let BertSelfOutput handle the projection
+            ctx = self.pbfa._forward_from_qkv(q, k, v, key_padding_mask=key_padding_mask, apply_out_proj=False)
             return (ctx,) if not output_attentions else (ctx, None)
     for name, module in model.named_modules():
         if module.__class__.__name__ == "BertSelfAttention":

@@ -14,6 +14,13 @@ except Exception:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'datasets'])
     from datasets import load_dataset
 
+# ensure tqdm is available for progress bars
+try:
+    from tqdm import tqdm
+except Exception:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'tqdm'])
+    from tqdm import tqdm
+
 
 def _ensure_lion_cls():
     try:
@@ -175,18 +182,22 @@ def main():
 
     model.train()
     for ep in range(args.epochs):
-        for step, batch in enumerate(train_loader):
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                out = model(
-                    input_ids=batch["input_ids"].to(device),
-                    attention_mask=batch["attention_mask"].to(device),
-                    token_type_ids=batch.get("token_type_ids", None).to(device) if "token_type_ids" in batch else None,
-                    labels=batch["labels"].to(device),
-                )
-                loss = out.loss / accum_steps
-            scaler.scale(loss).backward()
-            if (step + 1) % accum_steps == 0:
-                scaler.step(optim); scaler.update(); sched.step(); optim.zero_grad()
+        with tqdm(total=len(train_loader), desc=f"epoch {ep+1}/{args.epochs}", leave=True) as pbar:
+            for step, batch in enumerate(train_loader):
+                with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                    out = model(
+                        input_ids=batch["input_ids"].to(device),
+                        attention_mask=batch["attention_mask"].to(device),
+                        token_type_ids=batch.get("token_type_ids", None).to(device) if "token_type_ids" in batch else None,
+                        labels=batch["labels"].to(device),
+                    )
+                    raw_loss_val = out.loss.detach().item()
+                    loss = out.loss / accum_steps
+                scaler.scale(loss).backward()
+                if (step + 1) % accum_steps == 0:
+                    scaler.step(optim); scaler.update(); sched.step(); optim.zero_grad()
+                pbar.set_postfix(loss=f"{raw_loss_val:.4f}")
+                pbar.update(1)
         print(f"epoch {ep+1}/{args.epochs} done")
 
 if __name__ == "__main__":

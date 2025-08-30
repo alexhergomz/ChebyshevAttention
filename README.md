@@ -29,3 +29,7 @@ python local_runner/local_train.py --task mnli --attention softmax_flash --optim
 ```
 - optimizers: lion | adamw (Lion auto-installed if missing)
 - AMP is enabled on CUDA by default
+
+##Install
+
+- sudo apt update && sudo apt install -y python3-venv git && git clone https://github.com/alexhergomz/ChebyshevAttention.git && cd ChebyshevAttention && python3 -m venv .venv && . .venv/bin/activate && pip install -U pip && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && pip install transformers datasets accelerate evaluate

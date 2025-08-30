@@ -175,6 +175,7 @@ def main():
     ap.add_argument("--optimizer", choices=["lion","adamw"], default="lion")
     ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2"], default="pbfa_l2")
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--weight_decay", type=float, default=0.01)
     args, _ = ap.parse_known_args()
 
     device = torch.device(args.device)
@@ -189,10 +190,10 @@ def main():
 
     accum_steps = max(1, args.effective_batch // args.batch)
     if args.optimizer == 'adamw':
-        optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         Lion = _ensure_lion_cls()
-        optim = Lion(model.parameters(), lr=args.lr)
+        optim = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     from transformers.optimization import get_linear_schedule_with_warmup
     total_steps = (len(train_loader) * args.epochs) // accum_steps

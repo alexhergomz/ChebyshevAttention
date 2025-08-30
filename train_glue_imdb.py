@@ -157,6 +157,7 @@ def main():
     ap.add_argument("--warmup_pct", type=float, default=0.1)
     ap.add_argument("--optimizer", choices=["lion","adamw"], default="lion")
     ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2"], default="pbfa_l2")
+    ap.add_argument("--out", type=str, default=None)
     args, _ = ap.parse_known_args()
 
     device = torch.device(args.device)
@@ -164,6 +165,7 @@ def main():
     ds_train, ds_val1, ds_val2 = load_glue(args.task, tok, args.seq)
     train_loader = DataLoader(ds_train, batch_size=args.batch, shuffle=True)
     val_loader1 = DataLoader(ds_val1, batch_size=args.batch)
+    val_loader2 = DataLoader(ds_val2, batch_size=args.batch) if ds_val2 is not None else None
 
     model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=(3 if args.task=="mnli" else 2)).to(device)
     swap_attn(model, args.attention)
@@ -180,8 +182,20 @@ def main():
     sched = get_linear_schedule_with_warmup(optim, max(1, int(args.warmup_pct * total_steps)), total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
 
+    # prepare output directory
+    out_dir = Path(args.out) if args.out else None
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = out_dir / "metrics.json"
+        # initialize metrics file
+        if not metrics_path.exists():
+            with metrics_path.open('w', encoding='utf-8') as f:
+                json.dump({"task": args.task, "attention": args.attention, "epochs": args.epochs, "history": []}, f)
+
     model.train()
     for ep in range(args.epochs):
+        epoch_loss_sum = 0.0
+        steps_in_epoch = 0
         with tqdm(total=len(train_loader), desc=f"epoch {ep+1}/{args.epochs}", leave=True) as pbar:
             for step, batch in enumerate(train_loader):
                 with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
@@ -198,7 +212,62 @@ def main():
                     scaler.step(optim); scaler.update(); sched.step(); optim.zero_grad()
                 pbar.set_postfix(loss=f"{raw_loss_val:.4f}")
                 pbar.update(1)
+                epoch_loss_sum += raw_loss_val
+                steps_in_epoch += 1
         print(f"epoch {ep+1}/{args.epochs} done")
+
+        # evaluation at epoch end
+        model.eval()
+        def _eval_loader(loader):
+            preds_all = []
+            labels_all = []
+            with torch.no_grad():
+                for batch in loader:
+                    out = model(
+                        input_ids=batch["input_ids"].to(device),
+                        attention_mask=batch["attention_mask"].to(device),
+                        token_type_ids=batch.get("token_type_ids", None).to(device) if "token_type_ids" in batch else None,
+                        labels=batch.get("labels", None).to(device) if "labels" in batch else None,
+                    )
+                    logits = out.logits.detach().cpu()
+                    preds = logits.argmax(dim=-1).numpy()
+                    preds_all.append(preds)
+                    if "labels" in batch:
+                        labels_all.append(batch["labels"].detach().cpu().numpy())
+            import numpy as np
+            if len(preds_all) == 0:
+                return {}
+            preds_all = np.concatenate(preds_all, axis=0)
+            labels_all = np.concatenate(labels_all, axis=0) if len(labels_all) else None
+            return compute_metrics(args.task, preds_all, labels_all) if labels_all is not None else {}
+
+        val_metrics = _eval_loader(val_loader1)
+        val_mm_metrics = _eval_loader(val_loader2) if val_loader2 is not None else None
+        model.train()
+
+        # write metrics and checkpoint
+        if out_dir is not None:
+            avg_train_loss = epoch_loss_sum / max(1, steps_in_epoch)
+            history_item = {"epoch": ep + 1, "train_loss": avg_train_loss, "val": val_metrics}
+            if val_mm_metrics is not None:
+                history_item["val_mm"] = val_mm_metrics
+            # append to metrics.json
+            with (out_dir / "metrics.json").open('r+', encoding='utf-8') as f:
+                data = json.load(f)
+                data.setdefault("history", []).append(history_item)
+                f.seek(0)
+                json.dump(data, f)
+                f.truncate()
+
+            # checkpoint
+            ckpt = {
+                "epoch": ep + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optim.state_dict(),
+                "scheduler_state_dict": sched.state_dict(),
+                "args": vars(args),
+            }
+            torch.save(ckpt, out_dir / f"checkpoint_epoch_{ep+1}.pt")
 
 if __name__ == "__main__":
     main()

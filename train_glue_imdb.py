@@ -203,12 +203,22 @@ def main():
     # prepare output directory
     out_dir = Path(args.out) if args.out else None
     if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[save] output dir ready: {out_dir.resolve()}")
+        except Exception as e:
+            print(f"[save] failed to create output dir '{out_dir}': {e}")
         metrics_path = out_dir / "metrics.json"
         # initialize metrics file
         if not metrics_path.exists():
-            with metrics_path.open('w', encoding='utf-8') as f:
-                json.dump({"task": args.task, "attention": args.attention, "epochs": args.epochs, "history": []}, f)
+            try:
+                with metrics_path.open('w', encoding='utf-8') as f:
+                    json.dump({"task": args.task, "attention": args.attention, "epochs": args.epochs, "history": []}, f)
+                print(f"[save] initialized: {metrics_path}")
+            except Exception as e:
+                print(f"[save] failed to init metrics.json at '{metrics_path}': {e}")
+    else:
+        print("[save] --out not provided: no metrics/checkpoints will be saved")
 
     model.train()
     for ep in range(args.epochs):

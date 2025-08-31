@@ -65,6 +65,7 @@ class CollapsedPBFAOptimized(nn.Module):
         *,
         bias: bool = False,
         learnable_power: bool = False,
+        learnable_beta: bool = False,
         fused_qkv: bool = True,
         clamp_inputs: bool = True,
         triton_fast: bool = True,
@@ -90,6 +91,7 @@ class CollapsedPBFAOptimized(nn.Module):
         self._compiled = False
         self.norm: Optional[nn.Module] = None
         self.block_dh = block_dh
+        self.learnable_beta = learnable_beta
         dn = den_normalization.lower()
         if dn not in ("none", "l1", "l2", "l2prod"):
             raise ValueError("den_normalization must be one of: 'none', 'l1', 'l2', 'l2prod'")
@@ -125,8 +127,20 @@ class CollapsedPBFAOptimized(nn.Module):
             self.v_proj = nn.Linear(d_model, d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
 
-        # β initialisation: either fixed power-law or learnable exponent per head
-        if learnable_power:
+        # β initialisation: fixed power-law, learnable exponent, or learnable per-degree β via softmax
+        if self.learnable_beta and learnable_power:
+            raise ValueError("Choose either learnable_beta or learnable_power, not both.")
+        if self.learnable_beta:
+            P2 = 2 * order - 1
+            j_init = torch.arange(order, dtype=torch.float32)
+            alpha_init = (j_init + 1.0) ** -1.5
+            beta_init = _alpha_to_beta(alpha_init)  # (P2,)
+            beta_init = beta_init[:P2]
+            logits = beta_init.clamp_min(1e-8).log().expand(n_heads, -1).contiguous()
+            self.beta_logits = nn.Parameter(logits)
+            self.register_buffer("beta", torch.empty(0), persistent=False)
+            self.power_exponent = None
+        elif learnable_power:
             self.power_exponent = nn.Parameter(torch.full((n_heads,), -1.5, dtype=torch.float32))
             # Buffer beta will be materialised on first forward (device-aware)
             self.register_buffer("beta", torch.empty(0), persistent=False)
@@ -158,6 +172,8 @@ class CollapsedPBFAOptimized(nn.Module):
     # ------------------------------------------------------------------
     def _get_beta_heads(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return β broadcast for heads: (H, 2P-1)."""
+        if getattr(self, 'learnable_beta', False):
+            return torch.softmax(self.beta_logits.to(device=device, dtype=torch.float32), dim=-1).to(dtype)
         if self.power_exponent is not None:
             P2 = 2 * self.P - 1
             # Build directly a per-head β via power-law over 2P-1 terms

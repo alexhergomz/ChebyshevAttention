@@ -130,9 +130,14 @@ def swap_attn(model, mode: str):
             d_model = orig.query.weight.shape[1]
             n_heads = orig.num_attention_heads
             # Match BERT Linear layers (with bias); keep separate Q,K,V for easy weight copy
-            self.pbfa = CollapsedPBFAOptimized(
-                d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='l2'
-            )
+            if mode == 'pbfa_softbeta':
+                self.pbfa = CollapsedPBFAOptimized(
+                    d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='none', learnable_beta=True
+                )
+            else:
+                self.pbfa = CollapsedPBFAOptimized(
+                    d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='l2'
+                )
             # Copy weights and biases from the original self-attention projections
             self.pbfa.q_proj.weight.data.copy_(orig.query.weight);    self.pbfa.q_proj.bias.data.copy_(orig.query.bias)
             self.pbfa.k_proj.weight.data.copy_(orig.key.weight);      self.pbfa.k_proj.bias.data.copy_(orig.key.bias)
@@ -173,7 +178,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--warmup_pct", type=float, default=0.1)
     ap.add_argument("--optimizer", choices=["lion","adamw"], default="lion")
-    ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2"], default="pbfa_l2")
+    ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2","pbfa_softbeta"], default="pbfa_l2")
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     args, _ = ap.parse_known_args()

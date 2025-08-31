@@ -5,6 +5,7 @@ from typing import Dict, Tuple, List
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from transformers import BertTokenizerFast, BertForSequenceClassification
 import importlib, subprocess, sys
 
@@ -121,8 +122,10 @@ def swap_attn(model, mode: str):
     import torch.nn as nn
     try:
         from local_runner.pbfa_attention_fast import CollapsedPBFAOptimized
+        from local_runner.pbfa_mixdeg_attn import PBFAFeatureMixAttention
     except Exception:
         from pbfa_attention_fast import CollapsedPBFAOptimized
+        from pbfa_mixdeg_attn import PBFAFeatureMixAttention
     class BertSelfAttentionPBFAFast(nn.Module):
         def __init__(self, orig):
             super().__init__()
@@ -130,13 +133,22 @@ def swap_attn(model, mode: str):
             d_model = orig.query.weight.shape[1]
             n_heads = orig.num_attention_heads
             # Match BERT Linear layers (with bias); keep separate Q,K,V for easy weight copy
-            if mode == 'pbfa_softbeta':
+            if mode == 'pbfa_mixdeg':
+                self.pbfa = PBFAFeatureMixAttention(d_model, n_heads, max_n=6, bias=True, with_out_proj=False)
+                # copy weights and biases into q,k,v
+                self.pbfa.q_proj.weight.data.copy_(orig.query.weight);    self.pbfa.q_proj.bias.data.copy_(orig.query.bias)
+                self.pbfa.k_proj.weight.data.copy_(orig.key.weight);      self.pbfa.k_proj.bias.data.copy_(orig.key.bias)
+                self.pbfa.v_proj.weight.data.copy_(orig.value.weight);    self.pbfa.v_proj.bias.data.copy_(orig.value.bias)
+                self.out = orig.output.dense
+            elif mode == 'pbfa_softbeta':
                 self.pbfa = CollapsedPBFAOptimized(
-                    d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='none', learnable_beta=True
+                    d_model, n_heads, order=6, fused_qkv=False, bias=True,
+                    den_normalization='none', learnable_beta=True, clamp_inputs=False
                 )
             else:
                 self.pbfa = CollapsedPBFAOptimized(
-                    d_model, n_heads, order=6, fused_qkv=False, bias=True, den_normalization='l2'
+                    d_model, n_heads, order=6, fused_qkv=False, bias=True,
+                    den_normalization='l2', clamp_inputs=False
                 )
             # Copy weights and biases from the original self-attention projections
             self.pbfa.q_proj.weight.data.copy_(orig.query.weight);    self.pbfa.q_proj.bias.data.copy_(orig.query.bias)
@@ -146,6 +158,9 @@ def swap_attn(model, mode: str):
         def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False):
             # Compute Q,K,V using PBFA projections
             q, k, v = self.pbfa._fused_qkv(hidden_states)
+            # L2-normalize q and k per head-dim to keep inputs in [-1,1]
+            q = F.normalize(q, p=2.0, dim=-1)
+            k = F.normalize(k, p=2.0, dim=-1)
             # Convert HuggingFace attention_mask (1 for keep, 0 for pad) → boolean mask where True means mask
             key_padding_mask = None
             if attention_mask is not None:
@@ -155,9 +170,14 @@ def swap_attn(model, mode: str):
                 else:
                     attn = attention_mask
                 key_padding_mask = (attn == 0)
-            # Run attention core without PBFA's out_proj; let BertSelfOutput handle the projection
-            ctx = self.pbfa._forward_from_qkv(q, k, v, key_padding_mask=key_padding_mask, apply_out_proj=False)
-            return (ctx,) if not output_attentions else (ctx, None)
+            if mode == 'pbfa_mixdeg':
+                ctx = self.pbfa(hidden_states, attention_mask=attention_mask)
+                ctx = self.out(ctx)
+                return (ctx,) if not output_attentions else (ctx, None)
+            else:
+                # Run attention core without PBFA's out_proj; let BertSelfOutput handle the projection
+                ctx = self.pbfa._forward_from_qkv(q, k, v, key_padding_mask=key_padding_mask, apply_out_proj=False)
+                return (ctx,) if not output_attentions else (ctx, None)
     for name, module in model.named_modules():
         if module.__class__.__name__ == "BertSelfAttention":
             parent = model
@@ -178,7 +198,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--warmup_pct", type=float, default=0.1)
     ap.add_argument("--optimizer", choices=["lion","adamw"], default="lion")
-    ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2","pbfa_softbeta"], default="pbfa_l2")
+    ap.add_argument("--attention", choices=["softmax_flash","pbfa_l2","pbfa_softbeta","pbfa_mixdeg"], default="pbfa_l2")
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     args, _ = ap.parse_known_args()

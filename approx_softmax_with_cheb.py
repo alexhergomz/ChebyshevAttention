@@ -52,18 +52,43 @@ def _psi_total(x_vec: torch.Tensor, max_n: int, weights: torch.Tensor) -> torch.
     return torch.cat(parts, dim=-1).sum(dim=-2)
 
 
+def _bessel_I_n_series(n: int, x: torch.Tensor, terms: int = 50) -> torch.Tensor:
+    """Modified Bessel I_n(x) via power series (integer n >= 0).
+
+    I_n(x) = sum_{k=0..inf} (1 / (k! (n+k)!)) * (x/2)^{2k+n}
+    Computed in torch for moderate x, n. Suitable for visualization use.
+    """
+    assert n >= 0
+    x = x.to(torch.float64)  # improve stability
+    half = x / 2.0
+    result = torch.zeros_like(x, dtype=torch.float64)
+    term = (half ** n) / math.factorial(n)
+    result = result + term
+    # Accumulate k from 1..terms
+    for k in range(1, terms + 1):
+        term = term * (half * half) / (k * (n + k))
+        result = result + term
+    return result.to(dtype=torch.float32)
+
+
 def _weights_bessel(max_n: int, beta: float, device, dtype) -> torch.Tensor:
     # exp(beta * cos theta) = I0(beta) + 2 * sum_{n>=1} I_n(beta) cos(n theta)
-    ns = torch.arange(0, max_n + 1, device=device, dtype=dtype)
-    In = torch.special.iv(ns, torch.tensor(beta, device=device, dtype=dtype))
-    coeffs = In.clone()
-    if max_n >= 1:
-        coeffs[1:] = 2.0 * coeffs[1:]
-    w = coeffs / coeffs.sum()
+    beta_t = torch.tensor(beta, device=device, dtype=dtype)
+    coeffs = []
+    for n in range(0, max_n + 1):
+        In = _bessel_I_n_series(n, beta_t)
+        if n == 0:
+            coeffs.append(In)
+        else:
+            coeffs.append(2.0 * In)
+    coeffs_t = torch.stack(coeffs)
+    w = coeffs_t / coeffs_t.sum()
     return w
 
 
 def _weights_geometric(max_n: int, r: float, device, dtype) -> torch.Tensor:
+    # Clamp r to (0, 0.9999] to avoid pathological flat/expanding sequences
+    r = float(max(min(r, 0.9999), 1e-6))
     ns = torch.arange(0, max_n + 1, device=device, dtype=dtype)
     coeffs = (torch.tensor(r, device=device, dtype=dtype) ** ns)
     w = coeffs / coeffs.sum()
@@ -124,21 +149,20 @@ def main() -> None:
     else:
         w = _weights_onehot(args.max_n, args.onehot_n, device, dtype)
 
-    # Build psi features aggregated across dims for all rows
-    # Returns (S, F) where F = 1 + 2*max_n
-    def batch_psi(Z: torch.Tensor) -> torch.Tensor:
-        # Z: (S,d)
-        Z = F.normalize(Z, p=2.0, dim=-1)
-        parts = []
-        parts.append(torch.sqrt(w[0]).reshape(1) * _phi_n(Z, 0)[..., 0:1].sum(dim=-2))
-        for n in range(1, args.max_n + 1):
-            parts.append((torch.sqrt(w[n]).reshape(1) * _phi_n(Z, n)).sum(dim=-2))
-        return torch.cat(parts, dim=-1)
-
-    psi_q = batch_psi(q)  # (S,F)
-    psi_k = batch_psi(k)  # (S,F)
-    scores_cheb = psi_q @ psi_k.t()
-    A_cheb = torch.softmax(scores_cheb / tau, dim=-1)
+    # Compute mixture kernel scores by summing per-dimension inner products (no cross-dim mixing)
+    # K_mix(q_i, k_j) = sum_d [ w0*<phi0(q_id),phi0(k_jd)> + sum_{n>=1} w_n <phi_n(q_id),phi_n(k_jd)> ]
+    # Note: n=0 adds a constant d across all pairs; this cancels under row-softmax but kept for consistency.
+    # Precompute phi for all n
+    # Start with n=0 constant term
+    phiQ0 = _phi_n(q, 0)  # (S,d,1) all ones
+    phiK0 = _phi_n(k, 0)
+    scores_cheb = w[0] * torch.einsum('sdx,tdx->st', phiQ0, phiK0)
+    for n in range(1, args.max_n + 1):
+        phiQn = _phi_n(q, n)  # (S,d,2)
+        phiKn = _phi_n(k, n)
+        scores_cheb = scores_cheb + w[n] * torch.einsum('sdf,tdf->st', phiQn, phiKn)
+    # Convert scores into attention via softmax with same temperature (β absorbed if desired via beta flag)
+    A_cheb = torch.softmax((args.beta / tau) * scores_cheb, dim=-1)
 
     # Plots
     fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
